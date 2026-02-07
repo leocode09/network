@@ -49,7 +49,6 @@ class InflataApp extends StatelessWidget {
           seedColor: _kAccent,
           brightness: Brightness.light,
           surface: _kSurface,
-          background: const Color(0xFFF6F7F4),
         ),
         scaffoldBackgroundColor: const Color(0xFFF6F7F4),
         textTheme: GoogleFonts.manropeTextTheme().apply(
@@ -1334,6 +1333,11 @@ class _InflataHomePageState extends State<InflataHomePage>
                     label: 'WFD peers',
                     value: '$_wifiDirectConnected',
                     isActive: _wifiDirectConnected > 0,
+                  ),
+                  _StatusPill(
+                    label: 'WFD seen',
+                    value: '$_wifiDirectDiscovered',
+                    isActive: _wifiDirectDiscovered > 0,
                   ),
                 ],
               ],
