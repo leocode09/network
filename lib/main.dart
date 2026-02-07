@@ -350,7 +350,7 @@ class _InflataHomePageState extends State<InflataHomePage>
         final peer = _LanPeer(
           id: peerId,
           name: peerName,
-          address: datagram!.address,
+          address: datagram.address,
           port: port,
           lastSeen: now,
         );
@@ -453,6 +453,7 @@ class _InflataHomePageState extends State<InflataHomePage>
   void _handleLanSocket(Socket socket, {required bool outbound}) {
     final connection = _LanConnection(socket: socket, outbound: outbound);
     connection.subscription = socket
+        .cast<List<int>>()
         .transform(utf8.decoder)
         .transform(const LineSplitter())
         .listen(
