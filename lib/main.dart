@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
+import 'dart:math';
 import 'dart:typed_data';
 
 import 'package:device_info_plus/device_info_plus.dart';
@@ -11,6 +12,11 @@ import 'package:permission_handler/permission_handler.dart';
 const String serviceId = 'com.example.network.inflata';
 const int maxPeers = 20;
 const int maxLogEntries = 200;
+const int lanDiscoveryPort = 42111;
+const int lanTcpPort = 42112;
+const Duration lanAnnounceInterval = Duration(seconds: 2);
+const Duration lanPeerTimeout = Duration(seconds: 6);
+const int maxRecentMessages = 300;
 
 void main() {
   runApp(const InflataApp());
@@ -49,6 +55,11 @@ class _InflataHomePageState extends State<InflataHomePage>
   Timer? _noteDebounce;
   bool _suppressNoteBroadcast = false;
   int _lastNoteUpdateMs = 0;
+  final String _deviceId =
+      '${DateTime.now().microsecondsSinceEpoch}-${Random().nextInt(1 << 32)}';
+  final Set<String> _recentMessageIds = <String>{};
+  final List<String> _recentMessageOrder = <String>[];
+  int _messageCounter = 0;
 
   bool _running = false;
   bool _advertising = false;
@@ -57,6 +68,14 @@ class _InflataHomePageState extends State<InflataHomePage>
   final Set<String> _connectedEndpoints = <String>{};
   final Set<String> _connectingEndpoints = <String>{};
   final List<String> _logs = <String>[];
+
+  bool _lanRunning = false;
+  RawDatagramSocket? _lanSocket;
+  ServerSocket? _lanServer;
+  Timer? _lanAnnounceTimer;
+  final Map<String, _LanPeer> _lanPeers = <String, _LanPeer>{};
+  final Map<String, _LanConnection> _lanConnections = <String, _LanConnection>{};
+  final Set<String> _lanPendingConnections = <String>{};
 
   @override
   void initState() {
@@ -75,6 +94,7 @@ class _InflataHomePageState extends State<InflataHomePage>
     _sharedNoteController.dispose();
     _logScrollController.dispose();
     _noteDebounce?.cancel();
+    _stopLan();
     Nearby().stopAllEndpoints();
     Nearby().stopDiscovery();
     Nearby().stopAdvertising();
@@ -133,6 +153,8 @@ class _InflataHomePageState extends State<InflataHomePage>
         serviceId: serviceId,
       );
 
+      await _startLan();
+
       if (!mounted) {
         return;
       }
@@ -142,7 +164,9 @@ class _InflataHomePageState extends State<InflataHomePage>
         _discovering = discovering;
       });
 
-      _addLog('Advertising: $advertising, Discovery: $discovering');
+      _addLog(
+        'Advertising: $advertising, Discovery: $discovering, LAN: ${_lanRunning ? 'on' : 'off'}',
+      );
     } catch (error) {
       _addLog('Start error: $error');
       await _stopInflata();
@@ -157,6 +181,8 @@ class _InflataHomePageState extends State<InflataHomePage>
     } catch (error) {
       _addLog('Stop error: $error');
     }
+
+    await _stopLan();
 
     if (!mounted) {
       return;
@@ -322,21 +348,7 @@ class _InflataHomePageState extends State<InflataHomePage>
     }
 
     final message = utf8.decode(bytes);
-    try {
-      final data = jsonDecode(message);
-      if (data is Map<String, dynamic>) {
-        final type = data['type'];
-        if (type == 'note_update') {
-          _applyRemoteNoteUpdate(endpointId, data);
-          return;
-        }
-        _addLog('From $endpointId: ${data.toString()}');
-      } else {
-        _addLog('From $endpointId: $message');
-      }
-    } catch (_) {
-      _addLog('From $endpointId: $message');
-    }
+    _handleIncomingMessage(endpointId, message);
   }
 
   void _onPayloadTransferUpdate(String endpointId, PayloadTransferUpdate update) {
@@ -347,34 +359,88 @@ class _InflataHomePageState extends State<InflataHomePage>
     }
   }
 
+  String _newMessageId() {
+    final id =
+        '$_deviceId-${DateTime.now().microsecondsSinceEpoch}-${_messageCounter++}';
+    _rememberMessageId(id);
+    return id;
+  }
+
+  bool _rememberMessageId(String id) {
+    if (_recentMessageIds.contains(id)) {
+      return false;
+    }
+    _recentMessageIds.add(id);
+    _recentMessageOrder.add(id);
+    if (_recentMessageOrder.length > maxRecentMessages) {
+      final oldest = _recentMessageOrder.removeAt(0);
+      _recentMessageIds.remove(oldest);
+    }
+    return true;
+  }
+
+  void _handleIncomingMessage(String endpointLabel, String message) {
+    try {
+      final data = jsonDecode(message);
+      if (data is Map<String, dynamic>) {
+        final id = data['id'];
+        if (id is String && !_rememberMessageId(id)) {
+          return;
+        }
+        final type = data['type'];
+        if (type == 'note_update') {
+          _applyRemoteNoteUpdate(endpointLabel, data);
+          return;
+        }
+        if (type == 'chat') {
+          final text = data['message'];
+          final from = data['from'];
+          if (text is String) {
+            final sender = from is String && from.isNotEmpty
+                ? from
+                : endpointLabel;
+            _addLog('Message from $sender: $text');
+            return;
+          }
+        }
+        _addLog('From $endpointLabel: ${data.toString()}');
+      } else {
+        _addLog('From $endpointLabel: $message');
+      }
+    } catch (_) {
+      _addLog('From $endpointLabel: $message');
+    }
+  }
+
   Future<void> _sendMessage() async {
     final text = _messageController.text.trim();
     if (text.isEmpty) {
       return;
     }
 
-    if (_connectedEndpoints.isEmpty) {
+    if (_connectedEndpoints.isEmpty && _lanConnections.isEmpty) {
       _addLog('No connected peers to send to.');
       return;
     }
 
     final data = <String, dynamic>{
+      'id': _newMessageId(),
       'type': 'chat',
       'message': text,
       'timestamp': DateTime.now().toIso8601String(),
       'from': _deviceName,
     };
 
-    final jsonMessage = jsonEncode(data);
-    final bytes = Uint8List.fromList(utf8.encode(jsonMessage));
-
-    await _sendBytesToAll(bytes);
-
+    await _sendJsonToAll(data);
     _messageController.clear();
-    _addLog('Sent message to ${_connectedEndpoints.length} peer(s).');
+    _addLog(
+      'Sent message to ${_connectedEndpoints.length + _lanConnections.length} peer(s).',
+    );
   }
 
-  Future<void> _sendBytesToAll(Uint8List bytes) async {
+  Future<void> _sendJsonToAll(Map<String, dynamic> data) async {
+    final jsonMessage = jsonEncode(data);
+    final bytes = Uint8List.fromList(utf8.encode(jsonMessage));
     for (final endpointId in _connectedEndpoints) {
       try {
         await Nearby().sendBytesPayload(endpointId, bytes);
@@ -382,6 +448,8 @@ class _InflataHomePageState extends State<InflataHomePage>
         _addLog('Send failed to $endpointId: $error');
       }
     }
+
+    _sendJsonToLan(jsonMessage);
   }
 
   Future<void> _sendBytesToEndpoint(String endpointId, Uint8List bytes) async {
@@ -390,6 +458,23 @@ class _InflataHomePageState extends State<InflataHomePage>
     } catch (error) {
       _addLog('Send failed to $endpointId: $error');
     }
+  }
+
+  void _sendJsonToLan(String jsonMessage) {
+    if (_lanConnections.isEmpty) {
+      return;
+    }
+    for (final connection in _lanConnections.values) {
+      connection.sendJson(jsonMessage);
+    }
+  }
+
+  void _sendJsonToLanPeer(String peerId, String jsonMessage) {
+    final connection = _lanConnections[peerId];
+    if (connection == null) {
+      return;
+    }
+    connection.sendJson(jsonMessage);
   }
 
   void _onSharedNoteChanged() {
@@ -406,25 +491,27 @@ class _InflataHomePageState extends State<InflataHomePage>
     final timestamp = DateTime.now().millisecondsSinceEpoch;
     _lastNoteUpdateMs = timestamp;
 
-    if (_connectedEndpoints.isEmpty) {
+    if (_connectedEndpoints.isEmpty && _lanConnections.isEmpty) {
       return;
     }
 
     final data = <String, dynamic>{
+      'id': _newMessageId(),
       'type': 'note_update',
       'note': note,
       'timestamp': timestamp,
       'from': _deviceName,
     };
 
-    final jsonMessage = jsonEncode(data);
-    final bytes = Uint8List.fromList(utf8.encode(jsonMessage));
-    await _sendBytesToAll(bytes);
-    _addLog('Synced shared note to ${_connectedEndpoints.length} peer(s).');
+    await _sendJsonToAll(data);
+    _addLog(
+      'Synced shared note to ${_connectedEndpoints.length + _lanConnections.length} peer(s).',
+    );
   }
 
   Future<void> _sendNoteUpdateToEndpoint(String endpointId, int timestamp) async {
     final data = <String, dynamic>{
+      'id': _newMessageId(),
       'type': 'note_update',
       'note': _sharedNoteController.text,
       'timestamp': timestamp,
@@ -434,6 +521,19 @@ class _InflataHomePageState extends State<InflataHomePage>
     final jsonMessage = jsonEncode(data);
     final bytes = Uint8List.fromList(utf8.encode(jsonMessage));
     await _sendBytesToEndpoint(endpointId, bytes);
+  }
+
+  void _sendNoteUpdateToLanPeer(String peerId, int timestamp) {
+    final data = <String, dynamic>{
+      'id': _newMessageId(),
+      'type': 'note_update',
+      'note': _sharedNoteController.text,
+      'timestamp': timestamp,
+      'from': _deviceName,
+    };
+
+    final jsonMessage = jsonEncode(data);
+    _sendJsonToLanPeer(peerId, jsonMessage);
   }
 
   void _applyRemoteNoteUpdate(String endpointId, Map<String, dynamic> data) {
