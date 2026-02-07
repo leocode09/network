@@ -97,6 +97,10 @@ class _InflataHomePageState extends State<InflataHomePage>
       return;
     }
 
+    if (!mounted) {
+      return;
+    }
+
     setState(() {
       _running = true;
     });
@@ -120,6 +124,10 @@ class _InflataHomePageState extends State<InflataHomePage>
         onEndpointLost: _onEndpointLost,
       );
 
+      if (!mounted) {
+        return;
+      }
+
       setState(() {
         _advertising = advertising;
         _discovering = discovering;
@@ -134,11 +142,15 @@ class _InflataHomePageState extends State<InflataHomePage>
 
   Future<void> _stopInflata() async {
     try {
-      await Nearby().stopDiscovery();
-      await Nearby().stopAdvertising();
-      await Nearby().stopAllEndpoints();
+      Nearby().stopDiscovery();
+      Nearby().stopAdvertising();
+      Nearby().stopAllEndpoints();
     } catch (error) {
       _addLog('Stop error: $error');
+    }
+
+    if (!mounted) {
+      return;
     }
 
     setState(() {
@@ -185,6 +197,9 @@ class _InflataHomePageState extends State<InflataHomePage>
   }
 
   void _onEndpointFound(String endpointId, String endpointName, String service) {
+    if (!mounted) {
+      return;
+    }
     if (_endpointNames.containsKey(endpointId)) {
       return;
     }
@@ -211,6 +226,9 @@ class _InflataHomePageState extends State<InflataHomePage>
   }
 
   void _onEndpointLost(String endpointId) {
+    if (!mounted) {
+      return;
+    }
     final name = _endpointNames[endpointId] ?? endpointId;
     _addLog('Lost peer: $name ($endpointId).');
     setState(() {
@@ -227,6 +245,13 @@ class _InflataHomePageState extends State<InflataHomePage>
       return;
     }
 
+    if (mounted && !_endpointNames.containsKey(endpointId)) {
+      setState(() {
+        _endpointNames[endpointId] = info.endpointName;
+        _connectingEndpoints.add(endpointId);
+      });
+    }
+
     _addLog(
       'Connection initiated with ${info.endpointName}. Token: ${info.authenticationToken}',
     );
@@ -239,6 +264,9 @@ class _InflataHomePageState extends State<InflataHomePage>
   }
 
   void _onConnectionResult(String endpointId, Status status) {
+    if (!mounted) {
+      return;
+    }
     final name = _endpointNames[endpointId] ?? endpointId;
     _addLog('Connection result for $name: $status');
 
@@ -253,6 +281,9 @@ class _InflataHomePageState extends State<InflataHomePage>
   }
 
   void _onDisconnected(String endpointId) {
+    if (!mounted) {
+      return;
+    }
     final name = _endpointNames[endpointId] ?? endpointId;
     _addLog('Disconnected from $name ($endpointId).');
     setState(() {
@@ -323,6 +354,10 @@ class _InflataHomePageState extends State<InflataHomePage>
   }
 
   void _addLog(String message) {
+    if (!mounted) {
+      return;
+    }
+
     final timestamp = TimeOfDay.now().format(context);
     setState(() {
       _logs.add('[$timestamp] $message');
