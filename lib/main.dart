@@ -1,121 +1,564 @@
+import 'dart:convert';
+import 'dart:io';
+import 'dart:typed_data';
+
+import 'package:device_info_plus/device_info_plus.dart';
 import 'package:flutter/material.dart';
+import 'package:nearby_connections/nearby_connections.dart';
+import 'package:permission_handler/permission_handler.dart';
+
+const String serviceId = 'com.example.network.inflata';
+const int maxPeers = 20;
+const int maxLogEntries = 200;
 
 void main() {
-  runApp(const MyApp());
+  runApp(const InflataApp());
 }
 
-class MyApp extends StatelessWidget {
-  const MyApp({super.key});
+class InflataApp extends StatelessWidget {
+  const InflataApp({super.key});
 
-  // This widget is the root of your application.
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
-      title: 'Flutter Demo',
+      title: 'Inflata',
       theme: ThemeData(
-        // This is the theme of your application.
-        //
-        // TRY THIS: Try running your application with "flutter run". You'll see
-        // the application has a purple toolbar. Then, without quitting the app,
-        // try changing the seedColor in the colorScheme below to Colors.green
-        // and then invoke "hot reload" (save your changes or press the "hot
-        // reload" button in a Flutter-supported IDE, or press "r" if you used
-        // the command line to start the app).
-        //
-        // Notice that the counter didn't reset back to zero; the application
-        // state is not lost during the reload. To reset the state, use hot
-        // restart instead.
-        //
-        // This works for code too, not just values: Most code changes can be
-        // tested with just a hot reload.
-        colorScheme: .fromSeed(seedColor: Colors.deepPurple),
+        useMaterial3: true,
+        colorScheme: ColorScheme.fromSeed(seedColor: Colors.teal),
       ),
-      home: const MyHomePage(title: 'Flutter Demo Home Page'),
+      home: const InflataHomePage(),
     );
   }
 }
 
-class MyHomePage extends StatefulWidget {
-  const MyHomePage({super.key, required this.title});
-
-  // This widget is the home page of your application. It is stateful, meaning
-  // that it has a State object (defined below) that contains fields that affect
-  // how it looks.
-
-  // This class is the configuration for the state. It holds the values (in this
-  // case the title) provided by the parent (in this case the App widget) and
-  // used by the build method of the State. Fields in a Widget subclass are
-  // always marked "final".
-
-  final String title;
+class InflataHomePage extends StatefulWidget {
+  const InflataHomePage({super.key});
 
   @override
-  State<MyHomePage> createState() => _MyHomePageState();
+  State<InflataHomePage> createState() => _InflataHomePageState();
 }
 
-class _MyHomePageState extends State<MyHomePage> {
-  int _counter = 0;
+class _InflataHomePageState extends State<InflataHomePage>
+    with WidgetsBindingObserver {
+  final DeviceInfoPlugin _deviceInfo = DeviceInfoPlugin();
+  final TextEditingController _nameController = TextEditingController();
+  final TextEditingController _messageController = TextEditingController();
+  final ScrollController _logScrollController = ScrollController();
 
-  void _incrementCounter() {
+  bool _running = false;
+  bool _advertising = false;
+  bool _discovering = false;
+  final Map<String, String> _endpointNames = <String, String>{};
+  final Set<String> _connectedEndpoints = <String>{};
+  final Set<String> _connectingEndpoints = <String>{};
+  final List<String> _logs = <String>[];
+
+  @override
+  void initState() {
+    super.initState();
+    WidgetsBinding.instance.addObserver(this);
+    _nameController.text = 'Inflata-${DateTime.now().millisecondsSinceEpoch % 10000}';
+  }
+
+  @override
+  void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    _nameController.dispose();
+    _messageController.dispose();
+    _logScrollController.dispose();
+    Nearby().stopAllEndpoints();
+    Nearby().stopDiscovery();
+    Nearby().stopAdvertising();
+    super.dispose();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.paused && _running) {
+      _addLog('App paused. Consider stopping to save battery.');
+    }
+  }
+
+  String get _deviceName => _nameController.text.trim();
+
+  Future<void> _startInflata() async {
+    if (_running) {
+      return;
+    }
+
+    if (_deviceName.isEmpty) {
+      _addLog('Device name is required.');
+      return;
+    }
+
+    final hasPermission = await _ensurePermissions();
+    if (!hasPermission) {
+      _addLog('Required permissions not granted.');
+      return;
+    }
+
     setState(() {
-      // This call to setState tells the Flutter framework that something has
-      // changed in this State, which causes it to rerun the build method below
-      // so that the display can reflect the updated values. If we changed
-      // _counter without calling setState(), then the build method would not be
-      // called again, and so nothing would appear to happen.
-      _counter++;
+      _running = true;
     });
+
+    try {
+      _addLog('Starting advertising and discovery...');
+      final advertising = await Nearby().startAdvertising(
+        _deviceName,
+        serviceId,
+        Strategy.P2P_CLUSTER,
+        onConnectionInitiated: _onConnectionInitiated,
+        onConnectionResult: _onConnectionResult,
+        onDisconnected: _onDisconnected,
+      );
+
+      final discovering = await Nearby().startDiscovery(
+        _deviceName,
+        serviceId,
+        Strategy.P2P_CLUSTER,
+        onEndpointFound: _onEndpointFound,
+        onEndpointLost: _onEndpointLost,
+      );
+
+      setState(() {
+        _advertising = advertising;
+        _discovering = discovering;
+      });
+
+      _addLog('Advertising: $advertising, Discovery: $discovering');
+    } catch (error) {
+      _addLog('Start error: $error');
+      await _stopInflata();
+    }
+  }
+
+  Future<void> _stopInflata() async {
+    try {
+      await Nearby().stopDiscovery();
+      await Nearby().stopAdvertising();
+      await Nearby().stopAllEndpoints();
+    } catch (error) {
+      _addLog('Stop error: $error');
+    }
+
+    setState(() {
+      _running = false;
+      _advertising = false;
+      _discovering = false;
+      _connectedEndpoints.clear();
+      _connectingEndpoints.clear();
+      _endpointNames.clear();
+    });
+  }
+
+  Future<bool> _ensurePermissions() async {
+    if (!Platform.isAndroid) {
+      return true;
+    }
+
+    final androidInfo = await _deviceInfo.androidInfo;
+    final sdkInt = androidInfo.version.sdkInt;
+
+    if (sdkInt >= 33) {
+      final status = await Permission.nearbyWifiDevices.request();
+      if (status.isGranted) {
+        return true;
+      }
+
+      if (status.isPermanentlyDenied) {
+        await openAppSettings();
+      }
+
+      return false;
+    }
+
+    final status = await Permission.location.request();
+    if (status.isGranted) {
+      return true;
+    }
+
+    if (status.isPermanentlyDenied) {
+      await openAppSettings();
+    }
+
+    return false;
+  }
+
+  void _onEndpointFound(String endpointId, String endpointName, String service) {
+    if (_endpointNames.containsKey(endpointId)) {
+      return;
+    }
+
+    if (_connectedEndpoints.length >= maxPeers) {
+      _addLog('Max peers reached ($maxPeers). Ignoring $endpointName.');
+      return;
+    }
+
+    setState(() {
+      _endpointNames[endpointId] = endpointName;
+      _connectingEndpoints.add(endpointId);
+    });
+
+    _addLog('Found peer: $endpointName ($endpointId). Requesting connection.');
+
+    Nearby().requestConnection(
+      _deviceName,
+      endpointId,
+      onConnectionInitiated: _onConnectionInitiated,
+      onConnectionResult: _onConnectionResult,
+      onDisconnected: _onDisconnected,
+    );
+  }
+
+  void _onEndpointLost(String endpointId) {
+    final name = _endpointNames[endpointId] ?? endpointId;
+    _addLog('Lost peer: $name ($endpointId).');
+    setState(() {
+      _endpointNames.remove(endpointId);
+      _connectedEndpoints.remove(endpointId);
+      _connectingEndpoints.remove(endpointId);
+    });
+  }
+
+  void _onConnectionInitiated(String endpointId, ConnectionInfo info) {
+    if (_connectedEndpoints.length >= maxPeers) {
+      _addLog('Rejecting $endpointId. Max peers reached.');
+      Nearby().rejectConnection(endpointId);
+      return;
+    }
+
+    _addLog(
+      'Connection initiated with ${info.endpointName}. Token: ${info.authenticationToken}',
+    );
+
+    Nearby().acceptConnection(
+      endpointId,
+      onPayloadReceived: _onPayloadReceived,
+      onPayloadTransferUpdate: _onPayloadTransferUpdate,
+    );
+  }
+
+  void _onConnectionResult(String endpointId, Status status) {
+    final name = _endpointNames[endpointId] ?? endpointId;
+    _addLog('Connection result for $name: $status');
+
+    setState(() {
+      _connectingEndpoints.remove(endpointId);
+      if (status == Status.CONNECTED) {
+        _connectedEndpoints.add(endpointId);
+      } else {
+        _connectedEndpoints.remove(endpointId);
+      }
+    });
+  }
+
+  void _onDisconnected(String endpointId) {
+    final name = _endpointNames[endpointId] ?? endpointId;
+    _addLog('Disconnected from $name ($endpointId).');
+    setState(() {
+      _connectedEndpoints.remove(endpointId);
+    });
+  }
+
+  void _onPayloadReceived(String endpointId, Payload payload) {
+    if (payload.type != PayloadType.BYTES) {
+      _addLog('Received non-bytes payload from $endpointId.');
+      return;
+    }
+
+    final bytes = payload.bytes;
+    if (bytes == null) {
+      _addLog('Received empty payload from $endpointId.');
+      return;
+    }
+
+    final message = utf8.decode(bytes);
+    try {
+      final data = jsonDecode(message) as Map<String, dynamic>;
+      _addLog('From $endpointId: ${data.toString()}');
+    } catch (_) {
+      _addLog('From $endpointId: $message');
+    }
+  }
+
+  void _onPayloadTransferUpdate(String endpointId, PayloadTransferUpdate update) {
+    if (update.status == PayloadStatus.SUCCESS) {
+      _addLog('Payload transfer complete from $endpointId.');
+    } else if (update.status == PayloadStatus.FAILURE) {
+      _addLog('Payload transfer failed from $endpointId.');
+    }
+  }
+
+  Future<void> _sendMessage() async {
+    final text = _messageController.text.trim();
+    if (text.isEmpty) {
+      return;
+    }
+
+    if (_connectedEndpoints.isEmpty) {
+      _addLog('No connected peers to send to.');
+      return;
+    }
+
+    final data = <String, dynamic>{
+      'type': 'chat',
+      'message': text,
+      'timestamp': DateTime.now().toIso8601String(),
+      'from': _deviceName,
+    };
+
+    final jsonMessage = jsonEncode(data);
+    final bytes = Uint8List.fromList(utf8.encode(jsonMessage));
+
+    for (final endpointId in _connectedEndpoints) {
+      try {
+        await Nearby().sendBytesPayload(endpointId, bytes);
+      } catch (error) {
+        _addLog('Send failed to $endpointId: $error');
+      }
+    }
+
+    _messageController.clear();
+    _addLog('Sent message to ${_connectedEndpoints.length} peer(s).');
+  }
+
+  void _addLog(String message) {
+    final timestamp = TimeOfDay.now().format(context);
+    setState(() {
+      _logs.add('[$timestamp] $message');
+      if (_logs.length > maxLogEntries) {
+        _logs.removeAt(0);
+      }
+    });
+
+    if (_logScrollController.hasClients) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (_logScrollController.hasClients) {
+          _logScrollController.jumpTo(
+            _logScrollController.position.maxScrollExtent,
+          );
+        }
+      });
+    }
   }
 
   @override
   Widget build(BuildContext context) {
-    // This method is rerun every time setState is called, for instance as done
-    // by the _incrementCounter method above.
-    //
-    // The Flutter framework has been optimized to make rerunning build methods
-    // fast, so that you can just rebuild anything that needs updating rather
-    // than having to individually change instances of widgets.
     return Scaffold(
       appBar: AppBar(
-        // TRY THIS: Try changing the color here to a specific color (to
-        // Colors.amber, perhaps?) and trigger a hot reload to see the AppBar
-        // change color while the other colors stay the same.
-        backgroundColor: Theme.of(context).colorScheme.inversePrimary,
-        // Here we take the value from the MyHomePage object that was created by
-        // the App.build method, and use it to set our appbar title.
-        title: Text(widget.title),
+        title: const Text('Inflata P2P'),
       ),
-      body: Center(
-        // Center is a layout widget. It takes a single child and positions it
-        // in the middle of the parent.
+      body: ListView(
+        padding: const EdgeInsets.all(16),
+        children: [
+          _buildStatusCard(),
+          const SizedBox(height: 16),
+          _buildControlCard(),
+          const SizedBox(height: 16),
+          _buildPeersCard(),
+          const SizedBox(height: 16),
+          _buildMessageCard(),
+          const SizedBox(height: 16),
+          _buildNotesCard(),
+          const SizedBox(height: 16),
+          _buildLogsCard(),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildStatusCard() {
+    return Card(
+      child: Padding(
+        padding: const EdgeInsets.all(16),
         child: Column(
-          // Column is also a layout widget. It takes a list of children and
-          // arranges them vertically. By default, it sizes itself to fit its
-          // children horizontally, and tries to be as tall as its parent.
-          //
-          // Column has various properties to control how it sizes itself and
-          // how it positions its children. Here we use mainAxisAlignment to
-          // center the children vertically; the main axis here is the vertical
-          // axis because Columns are vertical (the cross axis would be
-          // horizontal).
-          //
-          // TRY THIS: Invoke "debug painting" (choose the "Toggle Debug Paint"
-          // action in the IDE, or press "p" in the console), to see the
-          // wireframe for each widget.
-          mainAxisAlignment: .center,
+          crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            const Text('You have pushed the button this many times:'),
-            Text(
-              '$_counter',
-              style: Theme.of(context).textTheme.headlineMedium,
+            const Text(
+              'Status',
+              style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
+            ),
+            const SizedBox(height: 8),
+            Text('Running: ${_running ? 'Yes' : 'No'}'),
+            Text('Advertising: ${_advertising ? 'Yes' : 'No'}'),
+            Text('Discovery: ${_discovering ? 'Yes' : 'No'}'),
+            Text('Connected: ${_connectedEndpoints.length}/$maxPeers'),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildControlCard() {
+    return Card(
+      child: Padding(
+        padding: const EdgeInsets.all(16),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            const Text(
+              'Controls',
+              style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
+            ),
+            const SizedBox(height: 12),
+            TextField(
+              controller: _nameController,
+              decoration: const InputDecoration(
+                labelText: 'Device name',
+                border: OutlineInputBorder(),
+              ),
+            ),
+            const SizedBox(height: 12),
+            Row(
+              children: [
+                Expanded(
+                  child: ElevatedButton(
+                    onPressed: _running ? null : _startInflata,
+                    child: const Text('Start'),
+                  ),
+                ),
+                const SizedBox(width: 12),
+                Expanded(
+                  child: OutlinedButton(
+                    onPressed: _running ? _stopInflata : null,
+                    child: const Text('Stop'),
+                  ),
+                ),
+              ],
             ),
           ],
         ),
       ),
-      floatingActionButton: FloatingActionButton(
-        onPressed: _incrementCounter,
-        tooltip: 'Increment',
-        child: const Icon(Icons.add),
+    );
+  }
+
+  Widget _buildPeersCard() {
+    final peers = _endpointNames.entries.toList();
+    return Card(
+      child: Padding(
+        padding: const EdgeInsets.all(16),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            const Text(
+              'Peers',
+              style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
+            ),
+            const SizedBox(height: 8),
+            if (peers.isEmpty)
+              const Text('No peers discovered yet.')
+            else
+              ...peers.map((entry) {
+                final status = _connectedEndpoints.contains(entry.key)
+                    ? 'connected'
+                    : _connectingEndpoints.contains(entry.key)
+                        ? 'connecting'
+                        : 'discovered';
+                return Padding(
+                  padding: const EdgeInsets.symmetric(vertical: 4),
+                  child: Text('${entry.value} (${entry.key}) - $status'),
+                );
+              }),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildMessageCard() {
+    return Card(
+      child: Padding(
+        padding: const EdgeInsets.all(16),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            const Text(
+              'Send Message',
+              style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
+            ),
+            const SizedBox(height: 8),
+            TextField(
+              controller: _messageController,
+              minLines: 1,
+              maxLines: 3,
+              decoration: const InputDecoration(
+                labelText: 'Message',
+                border: OutlineInputBorder(),
+              ),
+            ),
+            const SizedBox(height: 8),
+            SizedBox(
+              width: double.infinity,
+              child: ElevatedButton(
+                onPressed: _sendMessage,
+                child: const Text('Send to all connected'),
+              ),
+            ),
+            const SizedBox(height: 4),
+            const Text(
+              'Tip: Nearby Connections supports ~4MB per bytes payload. Chunk larger data.',
+              style: TextStyle(fontSize: 12),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildNotesCard() {
+    return Card(
+      child: Padding(
+        padding: const EdgeInsets.all(16),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: const [
+            Text(
+              'Best Practices',
+              style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
+            ),
+            SizedBox(height: 8),
+            Text('Use physical Android devices. Emulators do not support Wi-Fi Direct.'),
+            Text('Limit clusters to about 10-20 devices for reliability.'),
+            Text('Start discovery only when needed to save battery.'),
+            Text('Validate authentication tokens before auto-accept in production.'),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildLogsCard() {
+    return Card(
+      child: Padding(
+        padding: const EdgeInsets.all(16),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            const Text(
+              'Logs',
+              style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
+            ),
+            const SizedBox(height: 8),
+            SizedBox(
+              height: 220,
+              child: DecoratedBox(
+                decoration: BoxDecoration(
+                  border: Border.all(color: Colors.black12),
+                  borderRadius: BorderRadius.circular(8),
+                ),
+                child: ListView.builder(
+                  controller: _logScrollController,
+                  padding: const EdgeInsets.all(8),
+                  itemCount: _logs.length,
+                  itemBuilder: (context, index) => Text(
+                    _logs[index],
+                    style: const TextStyle(fontSize: 12),
+                  ),
+                ),
+              ),
+            ),
+          ],
+        ),
       ),
     );
   }
