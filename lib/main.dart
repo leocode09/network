@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 import 'dart:typed_data';
@@ -43,7 +44,11 @@ class _InflataHomePageState extends State<InflataHomePage>
   final DeviceInfoPlugin _deviceInfo = DeviceInfoPlugin();
   final TextEditingController _nameController = TextEditingController();
   final TextEditingController _messageController = TextEditingController();
+  final TextEditingController _sharedNoteController = TextEditingController();
   final ScrollController _logScrollController = ScrollController();
+  Timer? _noteDebounce;
+  bool _suppressNoteBroadcast = false;
+  int _lastNoteUpdateMs = 0;
 
   bool _running = false;
   bool _advertising = false;
@@ -58,6 +63,7 @@ class _InflataHomePageState extends State<InflataHomePage>
     super.initState();
     WidgetsBinding.instance.addObserver(this);
     _nameController.text = 'Inflata-${DateTime.now().millisecondsSinceEpoch % 10000}';
+    _sharedNoteController.addListener(_onSharedNoteChanged);
   }
 
   @override
@@ -65,7 +71,10 @@ class _InflataHomePageState extends State<InflataHomePage>
     WidgetsBinding.instance.removeObserver(this);
     _nameController.dispose();
     _messageController.dispose();
+    _sharedNoteController.removeListener(_onSharedNoteChanged);
+    _sharedNoteController.dispose();
     _logScrollController.dispose();
+    _noteDebounce?.cancel();
     Nearby().stopAllEndpoints();
     Nearby().stopDiscovery();
     Nearby().stopAdvertising();
@@ -305,8 +314,17 @@ class _InflataHomePageState extends State<InflataHomePage>
 
     final message = utf8.decode(bytes);
     try {
-      final data = jsonDecode(message) as Map<String, dynamic>;
-      _addLog('From $endpointId: ${data.toString()}');
+      final data = jsonDecode(message);
+      if (data is Map<String, dynamic>) {
+        final type = data['type'];
+        if (type == 'note_update') {
+          _applyRemoteNoteUpdate(endpointId, data);
+          return;
+        }
+        _addLog('From $endpointId: ${data.toString()}');
+      } else {
+        _addLog('From $endpointId: $message');
+      }
     } catch (_) {
       _addLog('From $endpointId: $message');
     }
@@ -341,6 +359,13 @@ class _InflataHomePageState extends State<InflataHomePage>
     final jsonMessage = jsonEncode(data);
     final bytes = Uint8List.fromList(utf8.encode(jsonMessage));
 
+    await _sendBytesToAll(bytes);
+
+    _messageController.clear();
+    _addLog('Sent message to ${_connectedEndpoints.length} peer(s).');
+  }
+
+  Future<void> _sendBytesToAll(Uint8List bytes) async {
     for (final endpointId in _connectedEndpoints) {
       try {
         await Nearby().sendBytesPayload(endpointId, bytes);
@@ -348,9 +373,64 @@ class _InflataHomePageState extends State<InflataHomePage>
         _addLog('Send failed to $endpointId: $error');
       }
     }
+  }
 
-    _messageController.clear();
-    _addLog('Sent message to ${_connectedEndpoints.length} peer(s).');
+  void _onSharedNoteChanged() {
+    if (_suppressNoteBroadcast) {
+      return;
+    }
+
+    _noteDebounce?.cancel();
+    _noteDebounce = Timer(const Duration(milliseconds: 400), _broadcastNoteUpdate);
+  }
+
+  Future<void> _broadcastNoteUpdate() async {
+    if (_connectedEndpoints.isEmpty) {
+      return;
+    }
+
+    final note = _sharedNoteController.text;
+    final timestamp = DateTime.now().millisecondsSinceEpoch;
+    _lastNoteUpdateMs = timestamp;
+
+    final data = <String, dynamic>{
+      'type': 'note_update',
+      'note': note,
+      'timestamp': timestamp,
+      'from': _deviceName,
+    };
+
+    final jsonMessage = jsonEncode(data);
+    final bytes = Uint8List.fromList(utf8.encode(jsonMessage));
+    await _sendBytesToAll(bytes);
+    _addLog('Synced shared note to ${_connectedEndpoints.length} peer(s).');
+  }
+
+  void _applyRemoteNoteUpdate(String endpointId, Map<String, dynamic> data) {
+    final timestamp = data['timestamp'];
+    if (timestamp is! int) {
+      _addLog('Invalid note update from $endpointId.');
+      return;
+    }
+
+    if (timestamp <= _lastNoteUpdateMs) {
+      return;
+    }
+
+    final note = data['note'];
+    if (note is! String) {
+      _addLog('Invalid note payload from $endpointId.');
+      return;
+    }
+
+    _lastNoteUpdateMs = timestamp;
+    _suppressNoteBroadcast = true;
+    _sharedNoteController.text = note;
+    _sharedNoteController.selection = TextSelection.collapsed(
+      offset: _sharedNoteController.text.length,
+    );
+    _suppressNoteBroadcast = false;
+    _addLog('Applied shared note from $endpointId.');
   }
 
   void _addLog(String message) {
@@ -393,6 +473,8 @@ class _InflataHomePageState extends State<InflataHomePage>
           _buildPeersCard(),
           const SizedBox(height: 16),
           _buildMessageCard(),
+          const SizedBox(height: 16),
+          _buildSharedNoteCard(),
           const SizedBox(height: 16),
           _buildNotesCard(),
           const SizedBox(height: 16),
@@ -532,6 +614,38 @@ class _InflataHomePageState extends State<InflataHomePage>
             const SizedBox(height: 4),
             const Text(
               'Tip: Nearby Connections supports ~4MB per bytes payload. Chunk larger data.',
+              style: TextStyle(fontSize: 12),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildSharedNoteCard() {
+    return Card(
+      child: Padding(
+        padding: const EdgeInsets.all(16),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            const Text(
+              'Shared Note (Syncs to all connected phones)',
+              style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
+            ),
+            const SizedBox(height: 8),
+            TextField(
+              controller: _sharedNoteController,
+              minLines: 5,
+              maxLines: 10,
+              decoration: const InputDecoration(
+                hintText: 'Type here. Changes sync automatically.',
+                border: OutlineInputBorder(),
+              ),
+            ),
+            const SizedBox(height: 8),
+            const Text(
+              'Updates are last-writer-wins using timestamps. Keep devices on similar clocks.',
               style: TextStyle(fontSize: 12),
             ),
           ],
