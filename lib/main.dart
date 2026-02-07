@@ -165,7 +165,7 @@ class _InflataHomePageState extends State<InflataHomePage>
       });
 
       _addLog(
-        'Advertising: $advertising, Discovery: $discovering, LAN: ${_lanRunning ? 'on' : 'off'}',
+        "Advertising: $advertising, Discovery: $discovering, LAN: ${_lanRunning ? 'on' : 'off'}",
       );
     } catch (error) {
       _addLog('Start error: $error');
@@ -229,6 +229,331 @@ class _InflataHomePageState extends State<InflataHomePage>
     }
 
     return false;
+  }
+
+  Future<void> _startLan() async {
+    if (_lanRunning) {
+      return;
+    }
+
+    try {
+      _lanServer = await ServerSocket.bind(
+        InternetAddress.anyIPv4,
+        lanTcpPort,
+        shared: true,
+      );
+      _lanServer!.listen(
+        (socket) => _handleLanSocket(socket, outbound: false),
+        onError: (error) => _addLog('LAN server error: $error'),
+      );
+
+      _lanSocket = await RawDatagramSocket.bind(
+        InternetAddress.anyIPv4,
+        lanDiscoveryPort,
+        reuseAddress: true,
+        reusePort: true,
+      );
+      _lanSocket!.broadcastEnabled = true;
+      _lanSocket!.listen(
+        _handleLanDatagram,
+        onError: (error) => _addLog('LAN discovery error: $error'),
+      );
+
+      _lanAnnounceTimer?.cancel();
+      _lanAnnounceTimer = Timer.periodic(
+        lanAnnounceInterval,
+        (_) => _sendLanAnnounce(),
+      );
+      _sendLanAnnounce();
+
+      if (!mounted) {
+        return;
+      }
+
+      setState(() {
+        _lanRunning = true;
+      });
+
+      _addLog('LAN discovery running on UDP $lanDiscoveryPort / TCP $lanTcpPort.');
+    } catch (error) {
+      _addLog('LAN start failed: $error');
+      await _stopLan();
+    }
+  }
+
+  Future<void> _stopLan() async {
+    _lanAnnounceTimer?.cancel();
+    _lanAnnounceTimer = null;
+
+    _lanSocket?.close();
+    _lanSocket = null;
+
+    final server = _lanServer;
+    _lanServer = null;
+    if (server != null) {
+      await server.close();
+    }
+
+    final connections = _lanConnections.values.toList();
+    _lanConnections.clear();
+    for (final connection in connections) {
+      await connection.close();
+    }
+    _lanPendingConnections.clear();
+    _lanPeers.clear();
+
+    if (!mounted) {
+      return;
+    }
+
+    setState(() {
+      _lanRunning = false;
+    });
+  }
+
+  void _handleLanDatagram(RawSocketEvent event) {
+    if (event != RawSocketEvent.read) {
+      return;
+    }
+
+    final socket = _lanSocket;
+    if (socket == null) {
+      return;
+    }
+
+    Datagram? datagram;
+    while ((datagram = socket.receive()) != null) {
+      final message = utf8.decode(datagram!.data);
+      try {
+        final data = jsonDecode(message);
+        if (data is! Map<String, dynamic>) {
+          continue;
+        }
+        if (data['type'] != 'lan_announce') {
+          continue;
+        }
+
+        final peerId = data['id'];
+        if (peerId is! String || peerId == _deviceId) {
+          continue;
+        }
+
+        final peerName = data['name'] is String ? data['name'] as String : peerId;
+        final port = data['port'] is int ? data['port'] as int : lanTcpPort;
+        final now = DateTime.now();
+        final peer = _LanPeer(
+          id: peerId,
+          name: peerName,
+          address: datagram!.address,
+          port: port,
+          lastSeen: now,
+        );
+
+        final existing = _lanPeers[peerId];
+        _lanPeers[peerId] = peer;
+        if (existing == null && mounted) {
+          setState(() {});
+        }
+
+        _maybeConnectToLanPeer(peer);
+      } catch (_) {
+        // Ignore malformed LAN discovery packets.
+      }
+    }
+  }
+
+  void _sendLanAnnounce() {
+    final socket = _lanSocket;
+    if (socket == null) {
+      return;
+    }
+
+    final data = <String, dynamic>{
+      'type': 'lan_announce',
+      'id': _deviceId,
+      'name': _deviceName,
+      'port': lanTcpPort,
+      'timestamp': DateTime.now().millisecondsSinceEpoch,
+    };
+    final bytes = utf8.encode(jsonEncode(data));
+    try {
+      socket.send(bytes, InternetAddress('255.255.255.255'), lanDiscoveryPort);
+    } catch (error) {
+      _addLog('LAN announce failed: $error');
+    }
+
+    _pruneLanPeers();
+  }
+
+  void _pruneLanPeers() {
+    if (_lanPeers.isEmpty) {
+      return;
+    }
+
+    final now = DateTime.now();
+    final stalePeers = _lanPeers.entries
+        .where((entry) => now.difference(entry.value.lastSeen) > lanPeerTimeout)
+        .map((entry) => entry.key)
+        .toList();
+
+    if (stalePeers.isEmpty) {
+      return;
+    }
+
+    for (final peerId in stalePeers) {
+      _lanPeers.remove(peerId);
+    }
+
+    if (mounted) {
+      setState(() {});
+    }
+  }
+
+  void _maybeConnectToLanPeer(_LanPeer peer) {
+    if (_lanConnections.containsKey(peer.id) ||
+        _lanPendingConnections.contains(peer.id)) {
+      return;
+    }
+
+    if (!_shouldInitiateLanConnection(peer.id)) {
+      return;
+    }
+
+    _lanPendingConnections.add(peer.id);
+    unawaited(_connectToLanPeer(peer));
+  }
+
+  bool _shouldInitiateLanConnection(String peerId) {
+    return _deviceId.compareTo(peerId) < 0;
+  }
+
+  Future<void> _connectToLanPeer(_LanPeer peer) async {
+    try {
+      final socket = await Socket.connect(
+        peer.address,
+        peer.port,
+        timeout: const Duration(seconds: 3),
+      );
+      _handleLanSocket(socket, outbound: true);
+    } catch (error) {
+      _addLog(
+        'LAN connect failed to ${peer.name} (${peer.address.address}:${peer.port}): $error',
+      );
+    } finally {
+      _lanPendingConnections.remove(peer.id);
+    }
+  }
+
+  void _handleLanSocket(Socket socket, {required bool outbound}) {
+    final connection = _LanConnection(socket: socket, outbound: outbound);
+    connection.subscription = socket
+        .transform(utf8.decoder)
+        .transform(const LineSplitter())
+        .listen(
+          (line) => _onLanLine(connection, line),
+          onError: (error) => _removeLanConnection(connection, error: error),
+          onDone: () => _removeLanConnection(connection),
+          cancelOnError: true,
+        );
+
+    _sendLanHello(connection);
+  }
+
+  void _sendLanHello(_LanConnection connection) {
+    final data = <String, dynamic>{
+      'type': 'lan_hello',
+      'id': _deviceId,
+      'name': _deviceName,
+    };
+    connection.sendJson(jsonEncode(data));
+  }
+
+  void _onLanLine(_LanConnection connection, String line) {
+    try {
+      final data = jsonDecode(line);
+      if (data is! Map<String, dynamic>) {
+        return;
+      }
+
+      final type = data['type'];
+      if (type == 'lan_hello') {
+        final peerId = data['id'];
+        final peerName = data['name'];
+        if (peerId is String) {
+          _registerLanConnection(
+            connection,
+            peerId: peerId,
+            peerName: peerName is String ? peerName : peerId,
+          );
+        }
+        return;
+      }
+
+      if (connection.peerId != null) {
+        final label = 'LAN:${connection.peerName ?? connection.peerId}';
+        _handleIncomingMessage(label, line);
+      }
+    } catch (_) {
+      if (connection.peerId != null) {
+        final label = 'LAN:${connection.peerName ?? connection.peerId}';
+        _handleIncomingMessage(label, line);
+      }
+    }
+  }
+
+  void _registerLanConnection(
+    _LanConnection connection, {
+    required String peerId,
+    required String peerName,
+  }) {
+    if (peerId == _deviceId) {
+      unawaited(connection.close());
+      return;
+    }
+
+    final existing = _lanConnections[peerId];
+    if (existing != null && existing != connection) {
+      final preferOutbound = _shouldInitiateLanConnection(peerId);
+      final keepNew = preferOutbound ? connection.outbound : !connection.outbound;
+      if (!keepNew) {
+        unawaited(connection.close());
+        return;
+      }
+      unawaited(existing.close());
+    }
+
+    connection.peerId = peerId;
+    connection.peerName = peerName;
+    _lanConnections[peerId] = connection;
+
+    if (mounted) {
+      setState(() {});
+    }
+
+    _addLog('LAN connected: $peerName ($peerId).');
+
+    if (_lastNoteUpdateMs > 0) {
+      _sendNoteUpdateToLanPeer(peerId, _lastNoteUpdateMs);
+      _addLog('Sent shared note snapshot to LAN peer $peerName.');
+    }
+  }
+
+  void _removeLanConnection(_LanConnection connection, {Object? error}) {
+    final peerId = connection.peerId;
+    if (peerId != null && _lanConnections[peerId] == connection) {
+      _lanConnections.remove(peerId);
+      if (mounted) {
+        setState(() {});
+      }
+      final name = connection.peerName ?? peerId;
+      _addLog('LAN disconnected: $name.');
+    }
+
+    if (error != null) {
+      _addLog('LAN socket error: $error');
+    }
+
+    unawaited(connection.close());
   }
 
   void _onEndpointFound(String endpointId, String endpointName, String service) {
@@ -629,7 +954,10 @@ class _InflataHomePageState extends State<InflataHomePage>
             Text('Running: ${_running ? 'Yes' : 'No'}'),
             Text('Advertising: ${_advertising ? 'Yes' : 'No'}'),
             Text('Discovery: ${_discovering ? 'Yes' : 'No'}'),
-            Text('Connected: ${_connectedEndpoints.length}/$maxPeers'),
+            Text('Nearby connected: ${_connectedEndpoints.length}/$maxPeers'),
+            Text('LAN running: ${_lanRunning ? 'Yes' : 'No'}'),
+            Text('LAN connected: ${_lanConnections.length}'),
+            Text('LAN discovered: ${_lanPeers.length}'),
           ],
         ),
       ),
@@ -680,7 +1008,8 @@ class _InflataHomePageState extends State<InflataHomePage>
   }
 
   Widget _buildPeersCard() {
-    final peers = _endpointNames.entries.toList();
+    final nearbyPeers = _endpointNames.entries.toList();
+    final lanPeers = _lanConnections.values.toList();
     return Card(
       child: Padding(
         padding: const EdgeInsets.all(16),
@@ -692,10 +1021,14 @@ class _InflataHomePageState extends State<InflataHomePage>
               style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
             ),
             const SizedBox(height: 8),
-            if (peers.isEmpty)
-              const Text('No peers discovered yet.')
+            const Text(
+              'Nearby',
+              style: TextStyle(fontWeight: FontWeight.w600),
+            ),
+            if (nearbyPeers.isEmpty)
+              const Text('No Nearby peers discovered yet.')
             else
-              ...peers.map((entry) {
+              ...nearbyPeers.map((entry) {
                 final status = _connectedEndpoints.contains(entry.key)
                     ? 'connected'
                     : _connectingEndpoints.contains(entry.key)
@@ -704,6 +1037,21 @@ class _InflataHomePageState extends State<InflataHomePage>
                 return Padding(
                   padding: const EdgeInsets.symmetric(vertical: 4),
                   child: Text('${entry.value} (${entry.key}) - $status'),
+                );
+              }),
+            const SizedBox(height: 12),
+            const Text(
+              'LAN',
+              style: TextStyle(fontWeight: FontWeight.w600),
+            ),
+            if (lanPeers.isEmpty)
+              const Text('No LAN peers connected yet.')
+            else
+              ...lanPeers.map((peer) {
+                final label = peer.peerName ?? peer.peerId ?? 'unknown';
+                return Padding(
+                  padding: const EdgeInsets.symmetric(vertical: 4),
+                  child: Text('$label (${peer.peerId ?? 'unknown'}) - connected'),
                 );
               }),
           ],
@@ -840,5 +1188,44 @@ class _InflataHomePageState extends State<InflataHomePage>
         ),
       ),
     );
+  }
+}
+
+class _LanPeer {
+  _LanPeer({
+    required this.id,
+    required this.name,
+    required this.address,
+    required this.port,
+    required this.lastSeen,
+  });
+
+  final String id;
+  final String name;
+  final InternetAddress address;
+  final int port;
+  final DateTime lastSeen;
+}
+
+class _LanConnection {
+  _LanConnection({
+    required this.socket,
+    required this.outbound,
+  });
+
+  final Socket socket;
+  final bool outbound;
+  String? peerId;
+  String? peerName;
+  StreamSubscription<String>? subscription;
+
+  void sendJson(String jsonMessage) {
+    socket.add(utf8.encode(jsonMessage));
+    socket.add(const [10]);
+  }
+
+  Future<void> close() async {
+    await subscription?.cancel();
+    socket.destroy();
   }
 }
