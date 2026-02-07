@@ -134,9 +134,13 @@ class _InflataHomePageState extends State<InflataHomePage>
       _running = true;
     });
 
+    await _startLan();
+
+    var advertising = false;
+    var discovering = false;
     try {
       _addLog('Starting advertising and discovery...');
-      final advertising = await Nearby().startAdvertising(
+      advertising = await Nearby().startAdvertising(
         _deviceName,
         Strategy.P2P_CLUSTER,
         onConnectionInitiated: _onConnectionInitiated,
@@ -145,30 +149,32 @@ class _InflataHomePageState extends State<InflataHomePage>
         serviceId: serviceId,
       );
 
-      final discovering = await Nearby().startDiscovery(
+      discovering = await Nearby().startDiscovery(
         _deviceName,
         Strategy.P2P_CLUSTER,
         onEndpointFound: _onEndpointFound,
         onEndpointLost: _onEndpointLost,
         serviceId: serviceId,
       );
-
-      await _startLan();
-
-      if (!mounted) {
-        return;
-      }
-
-      setState(() {
-        _advertising = advertising;
-        _discovering = discovering;
-      });
-
-      _addLog(
-        "Advertising: $advertising, Discovery: $discovering, LAN: ${_lanRunning ? 'on' : 'off'}",
-      );
     } catch (error) {
-      _addLog('Start error: $error');
+      _addLog('Nearby start error: $error');
+    }
+
+    if (!mounted) {
+      return;
+    }
+
+    setState(() {
+      _advertising = advertising;
+      _discovering = discovering;
+    });
+
+    _addLog(
+      "Advertising: $advertising, Discovery: $discovering, LAN: ${_lanRunning ? 'on' : 'off'}",
+    );
+
+    if (!advertising && !discovering && !_lanRunning) {
+      _addLog('All transports failed to start.');
       await _stopInflata();
     }
   }
@@ -951,11 +957,11 @@ class _InflataHomePageState extends State<InflataHomePage>
               style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
             ),
             const SizedBox(height: 8),
-            Text('Running: ${_running ? 'Yes' : 'No'}'),
-            Text('Advertising: ${_advertising ? 'Yes' : 'No'}'),
-            Text('Discovery: ${_discovering ? 'Yes' : 'No'}'),
+            Text("Running: ${_running ? 'Yes' : 'No'}"),
+            Text("Advertising: ${_advertising ? 'Yes' : 'No'}"),
+            Text("Discovery: ${_discovering ? 'Yes' : 'No'}"),
             Text('Nearby connected: ${_connectedEndpoints.length}/$maxPeers'),
-            Text('LAN running: ${_lanRunning ? 'Yes' : 'No'}'),
+            Text("LAN running: ${_lanRunning ? 'Yes' : 'No'}"),
             Text('LAN connected: ${_lanConnections.length}'),
             Text('LAN discovered: ${_lanPeers.length}'),
           ],
@@ -1051,7 +1057,9 @@ class _InflataHomePageState extends State<InflataHomePage>
                 final label = peer.peerName ?? peer.peerId ?? 'unknown';
                 return Padding(
                   padding: const EdgeInsets.symmetric(vertical: 4),
-                  child: Text('$label (${peer.peerId ?? 'unknown'}) - connected'),
+                  child: Text(
+                    "$label (${peer.peerId ?? 'unknown'}) - connected",
+                  ),
                 );
               }),
           ],
