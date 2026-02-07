@@ -8,15 +8,15 @@ This project implements an automatic Wi-Fi Direct transport on Android and wires
 - Android permissions/feature declarations: `android/app/src/main/AndroidManifest.xml`
 
 **High-level flow**
-1. Flutter starts the session in `_startInflata()` and calls `_startWifiDirect()`.
+1. Flutter starts the session in `_start()` and calls `_startWifiDirect()`.
 2. Android sets up `WifiP2pManager`, registers a broadcast receiver, optionally creates a group, and starts peer discovery.
 3. As peers are discovered, Android auto-connects to the first discovered peer when not in host-preferred mode.
 4. Once a group is formed, the group owner runs a TCP server and clients connect to the owner over a fixed port.
 5. Every connection exchanges a hello message and then relays payloads to Flutter. If the device is the group owner, it forwards payloads to all other peers.
 
 **Flutter-side wiring**
-- Control channel: `MethodChannel('inflata/wifi_direct')` in `lib/main.dart`.
-- Events channel: `EventChannel('inflata/wifi_direct_events')` streams status, peer, log, and message events to Flutter.
+- Control channel: `MethodChannel('wifi_direct')` in `lib/main.dart`.
+- Events channel: `EventChannel('wifi_direct_events')` streams status, peer, log, and message events to Flutter.
 - `_startWifiDirect()` sends `deviceId`, `deviceName`, and `host` (host preference toggle).
 - `_onWifiDirectEvent()` handles `status`, `peer_connected`, `message`, and `log` events.
 - `_sendJsonToWifiDirect()` forwards JSON payloads to Android for broadcasting.
@@ -59,4 +59,4 @@ This project implements an automatic Wi-Fi Direct transport on Android and wires
 **Key constants**
 - Wi-Fi Direct port: `42113` (`WIFI_DIRECT_PORT` in `MainActivity.kt`).
 - Connect timeout: `3500ms` (`CONNECT_TIMEOUT_MS` in `MainActivity.kt`).
-- Channels: `inflata/wifi_direct` (Method), `inflata/wifi_direct_events` (Events).
+- Channels: `wifi_direct` (Method), `wifi_direct_events` (Events).
