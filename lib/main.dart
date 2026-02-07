@@ -287,6 +287,11 @@ class _InflataHomePageState extends State<InflataHomePage>
         _connectedEndpoints.remove(endpointId);
       }
     });
+
+    if (status == Status.CONNECTED && _lastNoteUpdateMs > 0) {
+      unawaited(_sendNoteUpdateToEndpoint(endpointId, _lastNoteUpdateMs));
+      _addLog('Sent shared note snapshot to $name.');
+    }
   }
 
   void _onDisconnected(String endpointId) {
@@ -375,6 +380,14 @@ class _InflataHomePageState extends State<InflataHomePage>
     }
   }
 
+  Future<void> _sendBytesToEndpoint(String endpointId, Uint8List bytes) async {
+    try {
+      await Nearby().sendBytesPayload(endpointId, bytes);
+    } catch (error) {
+      _addLog('Send failed to $endpointId: $error');
+    }
+  }
+
   void _onSharedNoteChanged() {
     if (_suppressNoteBroadcast) {
       return;
@@ -385,13 +398,13 @@ class _InflataHomePageState extends State<InflataHomePage>
   }
 
   Future<void> _broadcastNoteUpdate() async {
-    if (_connectedEndpoints.isEmpty) {
-      return;
-    }
-
     final note = _sharedNoteController.text;
     final timestamp = DateTime.now().millisecondsSinceEpoch;
     _lastNoteUpdateMs = timestamp;
+
+    if (_connectedEndpoints.isEmpty) {
+      return;
+    }
 
     final data = <String, dynamic>{
       'type': 'note_update',
@@ -404,6 +417,19 @@ class _InflataHomePageState extends State<InflataHomePage>
     final bytes = Uint8List.fromList(utf8.encode(jsonMessage));
     await _sendBytesToAll(bytes);
     _addLog('Synced shared note to ${_connectedEndpoints.length} peer(s).');
+  }
+
+  Future<void> _sendNoteUpdateToEndpoint(String endpointId, int timestamp) async {
+    final data = <String, dynamic>{
+      'type': 'note_update',
+      'note': _sharedNoteController.text,
+      'timestamp': timestamp,
+      'from': _deviceName,
+    };
+
+    final jsonMessage = jsonEncode(data);
+    final bytes = Uint8List.fromList(utf8.encode(jsonMessage));
+    await _sendBytesToEndpoint(endpointId, bytes);
   }
 
   void _applyRemoteNoteUpdate(String endpointId, Map<String, dynamic> data) {
