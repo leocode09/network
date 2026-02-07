@@ -118,19 +118,19 @@ class _InflataHomePageState extends State<InflataHomePage>
       _addLog('Starting advertising and discovery...');
       final advertising = await Nearby().startAdvertising(
         _deviceName,
-        serviceId,
         Strategy.P2P_CLUSTER,
         onConnectionInitiated: _onConnectionInitiated,
         onConnectionResult: _onConnectionResult,
         onDisconnected: _onDisconnected,
+        serviceId: serviceId,
       );
 
       final discovering = await Nearby().startDiscovery(
         _deviceName,
-        serviceId,
         Strategy.P2P_CLUSTER,
         onEndpointFound: _onEndpointFound,
         onEndpointLost: _onEndpointLost,
+        serviceId: serviceId,
       );
 
       if (!mounted) {
@@ -234,8 +234,12 @@ class _InflataHomePageState extends State<InflataHomePage>
     );
   }
 
-  void _onEndpointLost(String endpointId) {
+  void _onEndpointLost(String? endpointId) {
     if (!mounted) {
+      return;
+    }
+    if (endpointId == null) {
+      _addLog('Lost peer with unknown endpoint id.');
       return;
     }
     final name = _endpointNames[endpointId] ?? endpointId;
@@ -267,7 +271,7 @@ class _InflataHomePageState extends State<InflataHomePage>
 
     Nearby().acceptConnection(
       endpointId,
-      onPayloadReceived: _onPayloadReceived,
+      onPayLoadRecieved: _onPayloadReceived,
       onPayloadTransferUpdate: _onPayloadTransferUpdate,
     );
   }
