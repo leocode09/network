@@ -2,10 +2,11 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 import 'dart:math';
-import 'dart:typed_data';
 
 import 'package:device_info_plus/device_info_plus.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
+import 'package:google_fonts/google_fonts.dart';
 import 'package:nearby_connections/nearby_connections.dart';
 import 'package:permission_handler/permission_handler.dart';
 
@@ -17,6 +18,19 @@ const int lanTcpPort = 42112;
 const Duration lanAnnounceInterval = Duration(seconds: 2);
 const Duration lanPeerTimeout = Duration(seconds: 6);
 const int maxRecentMessages = 300;
+
+const MethodChannel _wifiDirectChannel = MethodChannel('inflata/wifi_direct');
+const EventChannel _wifiDirectEvents = EventChannel(
+  'inflata/wifi_direct_events',
+);
+
+const Color _kInk = Color(0xFF0F172A);
+const Color _kMuted = Color(0xFF64748B);
+const Color _kSurface = Color(0xFFFFFFFF);
+const Color _kSurfaceAlt = Color(0xFFF1F5F9);
+const Color _kBorder = Color(0xFFE2E8F0);
+const Color _kAccent = Color(0xFF0F766E);
+const Color _kAccentSoft = Color(0xFFE6F4F1);
 
 void main() {
   runApp(const InflataApp());
@@ -31,7 +45,67 @@ class InflataApp extends StatelessWidget {
       title: 'Inflata',
       theme: ThemeData(
         useMaterial3: true,
-        colorScheme: ColorScheme.fromSeed(seedColor: Colors.teal),
+        colorScheme: ColorScheme.fromSeed(
+          seedColor: _kAccent,
+          brightness: Brightness.light,
+          surface: _kSurface,
+          background: const Color(0xFFF6F7F4),
+        ),
+        scaffoldBackgroundColor: const Color(0xFFF6F7F4),
+        textTheme: GoogleFonts.manropeTextTheme().apply(
+          bodyColor: _kInk,
+          displayColor: _kInk,
+        ),
+        appBarTheme: AppBarTheme(
+          backgroundColor: Colors.transparent,
+          elevation: 0,
+          surfaceTintColor: Colors.transparent,
+          titleTextStyle: GoogleFonts.manrope(
+            fontSize: 20,
+            fontWeight: FontWeight.w600,
+            color: _kInk,
+          ),
+        ),
+        inputDecorationTheme: InputDecorationTheme(
+          filled: true,
+          fillColor: _kSurface,
+          labelStyle: const TextStyle(color: _kMuted),
+          hintStyle: const TextStyle(color: _kMuted),
+          border: OutlineInputBorder(
+            borderRadius: BorderRadius.circular(14),
+            borderSide: const BorderSide(color: _kBorder),
+          ),
+          enabledBorder: OutlineInputBorder(
+            borderRadius: BorderRadius.circular(14),
+            borderSide: const BorderSide(color: _kBorder),
+          ),
+          focusedBorder: OutlineInputBorder(
+            borderRadius: BorderRadius.circular(14),
+            borderSide: const BorderSide(color: _kAccent, width: 1.2),
+          ),
+        ),
+        elevatedButtonTheme: ElevatedButtonThemeData(
+          style: ElevatedButton.styleFrom(
+            backgroundColor: _kAccent,
+            foregroundColor: Colors.white,
+            textStyle: const TextStyle(fontWeight: FontWeight.w600),
+            shape: RoundedRectangleBorder(
+              borderRadius: BorderRadius.circular(14),
+            ),
+            padding: const EdgeInsets.symmetric(vertical: 14),
+          ),
+        ),
+        outlinedButtonTheme: OutlinedButtonThemeData(
+          style: OutlinedButton.styleFrom(
+            foregroundColor: _kAccent,
+            side: const BorderSide(color: _kBorder),
+            textStyle: const TextStyle(fontWeight: FontWeight.w600),
+            shape: RoundedRectangleBorder(
+              borderRadius: BorderRadius.circular(14),
+            ),
+            padding: const EdgeInsets.symmetric(vertical: 14),
+          ),
+        ),
       ),
       home: const InflataHomePage(),
     );
@@ -74,14 +148,22 @@ class _InflataHomePageState extends State<InflataHomePage>
   ServerSocket? _lanServer;
   Timer? _lanAnnounceTimer;
   final Map<String, _LanPeer> _lanPeers = <String, _LanPeer>{};
-  final Map<String, _LanConnection> _lanConnections = <String, _LanConnection>{};
+  final Map<String, _LanConnection> _lanConnections =
+      <String, _LanConnection>{};
   final Set<String> _lanPendingConnections = <String>{};
+
+  StreamSubscription<dynamic>? _wifiDirectSubscription;
+  bool _wifiDirectRunning = false;
+  bool _wifiDirectHostPreferred = false;
+  int _wifiDirectConnected = 0;
+  int _wifiDirectDiscovered = 0;
 
   @override
   void initState() {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
-    _nameController.text = 'Inflata-${DateTime.now().millisecondsSinceEpoch % 10000}';
+    _nameController.text =
+        'Inflata-${DateTime.now().millisecondsSinceEpoch % 10000}';
     _sharedNoteController.addListener(_onSharedNoteChanged);
   }
 
@@ -95,6 +177,7 @@ class _InflataHomePageState extends State<InflataHomePage>
     _logScrollController.dispose();
     _noteDebounce?.cancel();
     _stopLan();
+    _stopWifiDirect();
     Nearby().stopAllEndpoints();
     Nearby().stopDiscovery();
     Nearby().stopAdvertising();
@@ -135,6 +218,7 @@ class _InflataHomePageState extends State<InflataHomePage>
     });
 
     await _startLan();
+    await _startWifiDirect();
 
     var advertising = false;
     var discovering = false;
@@ -170,10 +254,10 @@ class _InflataHomePageState extends State<InflataHomePage>
     });
 
     _addLog(
-      "Advertising: $advertising, Discovery: $discovering, LAN: ${_lanRunning ? 'on' : 'off'}",
+      "Advertising: $advertising, Discovery: $discovering, LAN: ${_lanRunning ? 'on' : 'off'}, Wi-Fi Direct: ${_wifiDirectRunning ? 'on' : 'off'}",
     );
 
-    if (!advertising && !discovering && !_lanRunning) {
+    if (!advertising && !discovering && !_lanRunning && !_wifiDirectRunning) {
       _addLog('All transports failed to start.');
       await _stopInflata();
     }
@@ -189,6 +273,7 @@ class _InflataHomePageState extends State<InflataHomePage>
     }
 
     await _stopLan();
+    await _stopWifiDirect();
 
     if (!mounted) {
       return;
@@ -280,7 +365,9 @@ class _InflataHomePageState extends State<InflataHomePage>
         _lanRunning = true;
       });
 
-      _addLog('LAN discovery running on UDP $lanDiscoveryPort / TCP $lanTcpPort.');
+      _addLog(
+        'LAN discovery running on UDP $lanDiscoveryPort / TCP $lanTcpPort.',
+      );
     } catch (error) {
       _addLog('LAN start failed: $error');
       await _stopLan();
@@ -317,6 +404,127 @@ class _InflataHomePageState extends State<InflataHomePage>
     });
   }
 
+  Future<void> _startWifiDirect() async {
+    if (!Platform.isAndroid) {
+      return;
+    }
+    try {
+      _wifiDirectSubscription ??= _wifiDirectEvents
+          .receiveBroadcastStream()
+          .listen(
+            _onWifiDirectEvent,
+            onError: (error) {
+              _addLog('Wi-Fi Direct event error: $error');
+            },
+          );
+
+      final result = await _wifiDirectChannel
+          .invokeMethod<bool>('start', <String, dynamic>{
+            'deviceId': _deviceId,
+            'deviceName': _deviceName,
+            'host': _wifiDirectHostPreferred,
+          });
+
+      if (!mounted) {
+        return;
+      }
+
+      setState(() {
+        _wifiDirectRunning = result ?? false;
+      });
+    } catch (error) {
+      _addLog('Wi-Fi Direct start failed: $error');
+    }
+  }
+
+  Future<void> _stopWifiDirect() async {
+    if (!Platform.isAndroid) {
+      return;
+    }
+    try {
+      await _wifiDirectChannel.invokeMethod('stop');
+    } catch (error) {
+      _addLog('Wi-Fi Direct stop failed: $error');
+    }
+
+    await _wifiDirectSubscription?.cancel();
+    _wifiDirectSubscription = null;
+
+    if (!mounted) {
+      return;
+    }
+
+    setState(() {
+      _wifiDirectRunning = false;
+      _wifiDirectConnected = 0;
+      _wifiDirectDiscovered = 0;
+    });
+  }
+
+  void _onWifiDirectEvent(dynamic event) {
+    if (!mounted) {
+      return;
+    }
+
+    if (event is Map) {
+      final type = event['type'];
+      if (type == 'status') {
+        setState(() {
+          _wifiDirectRunning = event['running'] == true;
+          final connected = event['connected'];
+          final discovered = event['discovered'];
+          if (connected is int) {
+            _wifiDirectConnected = connected;
+          }
+          if (discovered is int) {
+            _wifiDirectDiscovered = discovered;
+          }
+        });
+        return;
+      }
+
+      if (type == 'message') {
+        final payload = event['payload'];
+        if (payload is String) {
+          final fromName = event['fromName'];
+          final fromId = event['fromId'];
+          final label = fromName is String && fromName.isNotEmpty
+              ? 'WFD:$fromName'
+              : fromId is String && fromId.isNotEmpty
+              ? 'WFD:$fromId'
+              : 'WFD:peer';
+          _handleIncomingMessage(label, payload);
+        }
+        return;
+      }
+
+      if (type == 'peer_connected') {
+        final name = event['name'];
+        final id = event['id'];
+        if (name is String && name.isNotEmpty) {
+          _addLog('Wi-Fi Direct connected: $name.');
+        } else if (id is String && id.isNotEmpty) {
+          _addLog('Wi-Fi Direct connected: $id.');
+        } else {
+          _addLog('Wi-Fi Direct connected.');
+        }
+
+        if (_lastNoteUpdateMs > 0) {
+          unawaited(_sendNoteUpdateToWifiDirect());
+        }
+        return;
+      }
+
+      if (type == 'log') {
+        final message = event['message'];
+        if (message is String && message.isNotEmpty) {
+          _addLog('WFD: $message');
+        }
+        return;
+      }
+    }
+  }
+
   void _handleLanDatagram(RawSocketEvent event) {
     if (event != RawSocketEvent.read) {
       return;
@@ -344,7 +552,9 @@ class _InflataHomePageState extends State<InflataHomePage>
           continue;
         }
 
-        final peerName = data['name'] is String ? data['name'] as String : peerId;
+        final peerName = data['name'] is String
+            ? data['name'] as String
+            : peerId;
         final port = data['port'] is int ? data['port'] as int : lanTcpPort;
         final now = DateTime.now();
         final peer = _LanPeer(
@@ -521,7 +731,9 @@ class _InflataHomePageState extends State<InflataHomePage>
     final existing = _lanConnections[peerId];
     if (existing != null && existing != connection) {
       final preferOutbound = _shouldInitiateLanConnection(peerId);
-      final keepNew = preferOutbound ? connection.outbound : !connection.outbound;
+      final keepNew = preferOutbound
+          ? connection.outbound
+          : !connection.outbound;
       if (!keepNew) {
         unawaited(connection.close());
         return;
@@ -563,7 +775,11 @@ class _InflataHomePageState extends State<InflataHomePage>
     unawaited(connection.close());
   }
 
-  void _onEndpointFound(String endpointId, String endpointName, String service) {
+  void _onEndpointFound(
+    String endpointId,
+    String endpointName,
+    String service,
+  ) {
     if (!mounted) {
       return;
     }
@@ -683,7 +899,10 @@ class _InflataHomePageState extends State<InflataHomePage>
     _handleIncomingMessage(endpointId, message);
   }
 
-  void _onPayloadTransferUpdate(String endpointId, PayloadTransferUpdate update) {
+  void _onPayloadTransferUpdate(
+    String endpointId,
+    PayloadTransferUpdate update,
+  ) {
     if (update.status == PayloadStatus.SUCCESS) {
       _addLog('Payload transfer complete from $endpointId.');
     } else if (update.status == PayloadStatus.FAILURE) {
@@ -750,7 +969,9 @@ class _InflataHomePageState extends State<InflataHomePage>
       return;
     }
 
-    if (_connectedEndpoints.isEmpty && _lanConnections.isEmpty) {
+    if (_connectedEndpoints.isEmpty &&
+        _lanConnections.isEmpty &&
+        _wifiDirectConnected == 0) {
       _addLog('No connected peers to send to.');
       return;
     }
@@ -766,7 +987,7 @@ class _InflataHomePageState extends State<InflataHomePage>
     await _sendJsonToAll(data);
     _messageController.clear();
     _addLog(
-      'Sent message to ${_connectedEndpoints.length + _lanConnections.length} peer(s).',
+      'Sent message to ${_connectedEndpoints.length + _lanConnections.length + _wifiDirectConnected} peer(s).',
     );
   }
 
@@ -782,6 +1003,7 @@ class _InflataHomePageState extends State<InflataHomePage>
     }
 
     _sendJsonToLan(jsonMessage);
+    await _sendJsonToWifiDirect(jsonMessage);
   }
 
   Future<void> _sendBytesToEndpoint(String endpointId, Uint8List bytes) async {
@@ -809,13 +1031,46 @@ class _InflataHomePageState extends State<InflataHomePage>
     connection.sendJson(jsonMessage);
   }
 
+  Future<void> _sendJsonToWifiDirect(String jsonMessage) async {
+    if (!_wifiDirectRunning) {
+      return;
+    }
+    try {
+      await _wifiDirectChannel.invokeMethod('send', <String, dynamic>{
+        'payload': jsonMessage,
+      });
+    } catch (error) {
+      _addLog('Wi-Fi Direct send failed: $error');
+    }
+  }
+
+  Future<void> _sendNoteUpdateToWifiDirect() async {
+    if (_lastNoteUpdateMs <= 0) {
+      return;
+    }
+
+    final data = <String, dynamic>{
+      'id': _newMessageId(),
+      'type': 'note_update',
+      'note': _sharedNoteController.text,
+      'timestamp': _lastNoteUpdateMs,
+      'from': _deviceName,
+    };
+
+    final jsonMessage = jsonEncode(data);
+    await _sendJsonToWifiDirect(jsonMessage);
+  }
+
   void _onSharedNoteChanged() {
     if (_suppressNoteBroadcast) {
       return;
     }
 
     _noteDebounce?.cancel();
-    _noteDebounce = Timer(const Duration(milliseconds: 400), _broadcastNoteUpdate);
+    _noteDebounce = Timer(
+      const Duration(milliseconds: 400),
+      _broadcastNoteUpdate,
+    );
   }
 
   Future<void> _broadcastNoteUpdate() async {
@@ -823,7 +1078,9 @@ class _InflataHomePageState extends State<InflataHomePage>
     final timestamp = DateTime.now().millisecondsSinceEpoch;
     _lastNoteUpdateMs = timestamp;
 
-    if (_connectedEndpoints.isEmpty && _lanConnections.isEmpty) {
+    if (_connectedEndpoints.isEmpty &&
+        _lanConnections.isEmpty &&
+        _wifiDirectConnected == 0) {
       return;
     }
 
@@ -837,11 +1094,14 @@ class _InflataHomePageState extends State<InflataHomePage>
 
     await _sendJsonToAll(data);
     _addLog(
-      'Synced shared note to ${_connectedEndpoints.length + _lanConnections.length} peer(s).',
+      'Synced shared note to ${_connectedEndpoints.length + _lanConnections.length + _wifiDirectConnected} peer(s).',
     );
   }
 
-  Future<void> _sendNoteUpdateToEndpoint(String endpointId, int timestamp) async {
+  Future<void> _sendNoteUpdateToEndpoint(
+    String endpointId,
+    int timestamp,
+  ) async {
     final data = <String, dynamic>{
       'id': _newMessageId(),
       'type': 'note_update',
@@ -922,49 +1182,162 @@ class _InflataHomePageState extends State<InflataHomePage>
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      appBar: AppBar(
-        title: const Text('Inflata P2P'),
-      ),
-      body: ListView(
-        padding: const EdgeInsets.all(16),
-        children: [
-          _buildStatusCard(),
-          const SizedBox(height: 16),
-          _buildControlCard(),
-          const SizedBox(height: 16),
-          _buildPeersCard(),
-          const SizedBox(height: 16),
-          _buildMessageCard(),
-          const SizedBox(height: 16),
-          _buildSharedNoteCard(),
-          const SizedBox(height: 16),
-          _buildNotesCard(),
-          const SizedBox(height: 16),
-          _buildLogsCard(),
-        ],
+      extendBodyBehindAppBar: true,
+      appBar: AppBar(title: const Text('Inflata')),
+      body: Container(
+        decoration: const BoxDecoration(
+          gradient: LinearGradient(
+            colors: [Color(0xFFF6F7F4), Color(0xFFE8F1EC)],
+            begin: Alignment.topLeft,
+            end: Alignment.bottomRight,
+          ),
+        ),
+        child: SafeArea(
+          child: CustomScrollView(
+            slivers: [
+              SliverToBoxAdapter(
+                child: Padding(
+                  padding: const EdgeInsets.fromLTRB(20, 8, 20, 12),
+                  child: _buildHeader(),
+                ),
+              ),
+              SliverPadding(
+                padding: const EdgeInsets.fromLTRB(20, 0, 20, 24),
+                sliver: SliverList(
+                  delegate: SliverChildListDelegate([
+                    _buildStatusCard(),
+                    const SizedBox(height: 16),
+                    _buildControlCard(),
+                    const SizedBox(height: 16),
+                    _buildMessageCard(),
+                    const SizedBox(height: 16),
+                    _buildSharedNoteCard(),
+                    const SizedBox(height: 16),
+                    _buildPeersCard(),
+                    const SizedBox(height: 16),
+                    _buildNotesCard(),
+                    const SizedBox(height: 16),
+                    _buildLogsCard(),
+                  ]),
+                ),
+              ),
+            ],
+          ),
+        ),
       ),
     );
   }
 
+  Widget _buildHeader() {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Text(
+          'Peer-to-peer workspace',
+          style: Theme.of(
+            context,
+          ).textTheme.headlineSmall?.copyWith(fontWeight: FontWeight.w600),
+        ),
+        const SizedBox(height: 6),
+        Text(
+          'Connect nearby devices, sync notes, and broadcast updates securely.',
+          style: Theme.of(
+            context,
+          ).textTheme.bodyMedium?.copyWith(color: _kMuted),
+        ),
+        const SizedBox(height: 12),
+        Wrap(
+          spacing: 8,
+          runSpacing: 8,
+          children: [
+            _StatusPill(
+              label: 'Session',
+              value: _running ? 'Active' : 'Idle',
+              isActive: _running,
+            ),
+            _StatusPill(
+              label: 'Peers',
+              value:
+                  '${_connectedEndpoints.length + _lanConnections.length + _wifiDirectConnected}',
+              isActive:
+                  _connectedEndpoints.isNotEmpty ||
+                  _lanConnections.isNotEmpty ||
+                  _wifiDirectConnected > 0,
+            ),
+            _StatusPill(
+              label: 'LAN',
+              value: _lanRunning ? 'On' : 'Off',
+              isActive: _lanRunning,
+            ),
+            if (Platform.isAndroid)
+              _StatusPill(
+                label: 'Wi-Fi Direct',
+                value: _wifiDirectRunning ? 'On' : 'Off',
+                isActive: _wifiDirectRunning,
+              ),
+          ],
+        ),
+      ],
+    );
+  }
+
   Widget _buildStatusCard() {
-    return Card(
+    return _SurfaceCard(
       child: Padding(
-        padding: const EdgeInsets.all(16),
+        padding: const EdgeInsets.all(18),
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            const Text(
-              'Status',
-              style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
+            _SectionHeader(title: 'Status', subtitle: 'Live transport health'),
+            const SizedBox(height: 12),
+            Wrap(
+              spacing: 8,
+              runSpacing: 8,
+              children: [
+                _StatusPill(
+                  label: 'Running',
+                  value: _running ? 'On' : 'Off',
+                  isActive: _running,
+                ),
+                _StatusPill(
+                  label: 'Advertising',
+                  value: _advertising ? 'On' : 'Off',
+                  isActive: _advertising,
+                ),
+                _StatusPill(
+                  label: 'Discovery',
+                  value: _discovering ? 'On' : 'Off',
+                  isActive: _discovering,
+                ),
+                _StatusPill(
+                  label: 'Nearby',
+                  value: '${_connectedEndpoints.length}/$maxPeers',
+                  isActive: _connectedEndpoints.isNotEmpty,
+                ),
+                _StatusPill(
+                  label: 'LAN',
+                  value: _lanRunning ? 'On' : 'Off',
+                  isActive: _lanRunning,
+                ),
+                _StatusPill(
+                  label: 'LAN peers',
+                  value: '${_lanConnections.length}',
+                  isActive: _lanConnections.isNotEmpty,
+                ),
+                if (Platform.isAndroid) ...[
+                  _StatusPill(
+                    label: 'Wi-Fi Direct',
+                    value: _wifiDirectRunning ? 'On' : 'Off',
+                    isActive: _wifiDirectRunning,
+                  ),
+                  _StatusPill(
+                    label: 'WFD peers',
+                    value: '$_wifiDirectConnected',
+                    isActive: _wifiDirectConnected > 0,
+                  ),
+                ],
+              ],
             ),
-            const SizedBox(height: 8),
-            Text("Running: ${_running ? 'Yes' : 'No'}"),
-            Text("Advertising: ${_advertising ? 'Yes' : 'No'}"),
-            Text("Discovery: ${_discovering ? 'Yes' : 'No'}"),
-            Text('Nearby connected: ${_connectedEndpoints.length}/$maxPeers'),
-            Text("LAN running: ${_lanRunning ? 'Yes' : 'No'}"),
-            Text('LAN connected: ${_lanConnections.length}'),
-            Text('LAN discovered: ${_lanPeers.length}'),
           ],
         ),
       ),
@@ -972,25 +1345,34 @@ class _InflataHomePageState extends State<InflataHomePage>
   }
 
   Widget _buildControlCard() {
-    return Card(
+    return _SurfaceCard(
       child: Padding(
-        padding: const EdgeInsets.all(16),
+        padding: const EdgeInsets.all(18),
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            const Text(
-              'Controls',
-              style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
-            ),
-            const SizedBox(height: 12),
+            _SectionHeader(title: 'Controls', subtitle: 'Name and session'),
+            const SizedBox(height: 14),
             TextField(
               controller: _nameController,
-              decoration: const InputDecoration(
-                labelText: 'Device name',
-                border: OutlineInputBorder(),
-              ),
+              decoration: const InputDecoration(labelText: 'Device name'),
             ),
-            const SizedBox(height: 12),
+            if (Platform.isAndroid) ...[
+              const SizedBox(height: 14),
+              _InlineSwitch(
+                title: 'Wi-Fi Direct host',
+                subtitle: 'Enable on one device to act as group owner.',
+                value: _wifiDirectHostPreferred,
+                onChanged: _running
+                    ? null
+                    : (value) {
+                        setState(() {
+                          _wifiDirectHostPreferred = value;
+                        });
+                      },
+              ),
+            ],
+            const SizedBox(height: 14),
             Row(
               children: [
                 Expanded(
@@ -1017,42 +1399,56 @@ class _InflataHomePageState extends State<InflataHomePage>
   Widget _buildPeersCard() {
     final nearbyPeers = _endpointNames.entries.toList();
     final lanPeers = _lanConnections.values.toList();
-    return Card(
+    return _SurfaceCard(
       child: Padding(
-        padding: const EdgeInsets.all(16),
+        padding: const EdgeInsets.all(18),
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            const Text(
-              'Peers',
-              style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
-            ),
-            const SizedBox(height: 8),
-            const Text(
+            _SectionHeader(title: 'Peers', subtitle: 'Active connections'),
+            const SizedBox(height: 12),
+            Text(
               'Nearby',
-              style: TextStyle(fontWeight: FontWeight.w600),
+              style: Theme.of(
+                context,
+              ).textTheme.titleSmall?.copyWith(fontWeight: FontWeight.w600),
             ),
             if (nearbyPeers.isEmpty)
-              const Text('No Nearby peers discovered yet.')
+              Text(
+                'No Nearby peers discovered yet.',
+                style: Theme.of(
+                  context,
+                ).textTheme.bodySmall?.copyWith(color: _kMuted),
+              )
             else
               ...nearbyPeers.map((entry) {
                 final status = _connectedEndpoints.contains(entry.key)
                     ? 'connected'
                     : _connectingEndpoints.contains(entry.key)
-                        ? 'connecting'
-                        : 'discovered';
+                    ? 'connecting'
+                    : 'discovered';
                 return Padding(
                   padding: const EdgeInsets.symmetric(vertical: 4),
-                  child: Text('${entry.value} (${entry.key}) - $status'),
+                  child: Text(
+                    '${entry.value} (${entry.key}) - $status',
+                    style: Theme.of(context).textTheme.bodyMedium,
+                  ),
                 );
               }),
             const SizedBox(height: 12),
-            const Text(
+            Text(
               'LAN',
-              style: TextStyle(fontWeight: FontWeight.w600),
+              style: Theme.of(
+                context,
+              ).textTheme.titleSmall?.copyWith(fontWeight: FontWeight.w600),
             ),
             if (lanPeers.isEmpty)
-              const Text('No LAN peers connected yet.')
+              Text(
+                'No LAN peers connected yet.',
+                style: Theme.of(
+                  context,
+                ).textTheme.bodySmall?.copyWith(color: _kMuted),
+              )
             else
               ...lanPeers.map((peer) {
                 final label = peer.peerName ?? peer.peerId ?? 'unknown';
@@ -1070,27 +1466,24 @@ class _InflataHomePageState extends State<InflataHomePage>
   }
 
   Widget _buildMessageCard() {
-    return Card(
+    return _SurfaceCard(
       child: Padding(
-        padding: const EdgeInsets.all(16),
+        padding: const EdgeInsets.all(18),
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            const Text(
-              'Send Message',
-              style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
+            _SectionHeader(
+              title: 'Broadcast',
+              subtitle: 'Send a message to all connected peers',
             ),
-            const SizedBox(height: 8),
+            const SizedBox(height: 12),
             TextField(
               controller: _messageController,
               minLines: 1,
               maxLines: 3,
-              decoration: const InputDecoration(
-                labelText: 'Message',
-                border: OutlineInputBorder(),
-              ),
+              decoration: const InputDecoration(labelText: 'Message'),
             ),
-            const SizedBox(height: 8),
+            const SizedBox(height: 12),
             SizedBox(
               width: double.infinity,
               child: ElevatedButton(
@@ -1098,10 +1491,12 @@ class _InflataHomePageState extends State<InflataHomePage>
                 child: const Text('Send to all connected'),
               ),
             ),
-            const SizedBox(height: 4),
-            const Text(
+            const SizedBox(height: 6),
+            Text(
               'Tip: Nearby Connections supports ~4MB per bytes payload. Chunk larger data.',
-              style: TextStyle(fontSize: 12),
+              style: Theme.of(
+                context,
+              ).textTheme.bodySmall?.copyWith(color: _kMuted),
             ),
           ],
         ),
@@ -1110,30 +1505,31 @@ class _InflataHomePageState extends State<InflataHomePage>
   }
 
   Widget _buildSharedNoteCard() {
-    return Card(
+    return _SurfaceCard(
       child: Padding(
-        padding: const EdgeInsets.all(16),
+        padding: const EdgeInsets.all(18),
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            const Text(
-              'Shared Note (Syncs to all connected phones)',
-              style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
+            _SectionHeader(
+              title: 'Shared Note',
+              subtitle: 'Live sync to every connected device',
             ),
-            const SizedBox(height: 8),
+            const SizedBox(height: 12),
             TextField(
               controller: _sharedNoteController,
               minLines: 5,
               maxLines: 10,
               decoration: const InputDecoration(
                 hintText: 'Type here. Changes sync automatically.',
-                border: OutlineInputBorder(),
               ),
             ),
-            const SizedBox(height: 8),
-            const Text(
+            const SizedBox(height: 6),
+            Text(
               'Updates are last-writer-wins using timestamps. Keep devices on similar clocks.',
-              style: TextStyle(fontSize: 12),
+              style: Theme.of(
+                context,
+              ).textTheme.bodySmall?.copyWith(color: _kMuted),
             ),
           ],
         ),
@@ -1142,21 +1538,34 @@ class _InflataHomePageState extends State<InflataHomePage>
   }
 
   Widget _buildNotesCard() {
-    return Card(
+    return _SurfaceCard(
       child: Padding(
-        padding: const EdgeInsets.all(16),
+        padding: const EdgeInsets.all(18),
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
-          children: const [
-            Text(
-              'Best Practices',
-              style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
+          children: [
+            const _SectionHeader(
+              title: 'Best Practices',
+              subtitle: 'Operational reminders',
             ),
-            SizedBox(height: 8),
-            Text('Use physical Android devices. Emulators do not support Wi-Fi Direct.'),
-            Text('Limit clusters to about 10-20 devices for reliability.'),
-            Text('Start discovery only when needed to save battery.'),
-            Text('Validate authentication tokens before auto-accept in production.'),
+            const SizedBox(height: 12),
+            _BulletLine(
+              text:
+                  'Use physical Android devices. Emulators do not support Wi-Fi Direct.',
+            ),
+            const SizedBox(height: 6),
+            const _BulletLine(
+              text: 'Limit clusters to about 10-20 devices for reliability.',
+            ),
+            const SizedBox(height: 6),
+            const _BulletLine(
+              text: 'Start discovery only when needed to save battery.',
+            ),
+            const SizedBox(height: 6),
+            const _BulletLine(
+              text:
+                  'Validate authentication tokens before auto-accept in production.',
+            ),
           ],
         ),
       ),
@@ -1164,31 +1573,31 @@ class _InflataHomePageState extends State<InflataHomePage>
   }
 
   Widget _buildLogsCard() {
-    return Card(
+    return _SurfaceCard(
       child: Padding(
-        padding: const EdgeInsets.all(16),
+        padding: const EdgeInsets.all(18),
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            const Text(
-              'Logs',
-              style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
-            ),
-            const SizedBox(height: 8),
+            _SectionHeader(title: 'Logs', subtitle: 'Recent activity'),
+            const SizedBox(height: 12),
             SizedBox(
               height: 220,
               child: DecoratedBox(
                 decoration: BoxDecoration(
-                  border: Border.all(color: Colors.black12),
-                  borderRadius: BorderRadius.circular(8),
+                  color: _kSurfaceAlt,
+                  border: Border.all(color: _kBorder),
+                  borderRadius: BorderRadius.circular(14),
                 ),
                 child: ListView.builder(
                   controller: _logScrollController,
-                  padding: const EdgeInsets.all(8),
+                  padding: const EdgeInsets.all(12),
                   itemCount: _logs.length,
                   itemBuilder: (context, index) => Text(
                     _logs[index],
-                    style: const TextStyle(fontSize: 12),
+                    style: Theme.of(
+                      context,
+                    ).textTheme.bodySmall?.copyWith(color: _kMuted),
                   ),
                 ),
               ),
@@ -1196,6 +1605,190 @@ class _InflataHomePageState extends State<InflataHomePage>
           ],
         ),
       ),
+    );
+  }
+}
+
+class _SurfaceCard extends StatelessWidget {
+  const _SurfaceCard({required this.child});
+
+  final Widget child;
+
+  @override
+  Widget build(BuildContext context) {
+    return DecoratedBox(
+      decoration: BoxDecoration(
+        color: _kSurface,
+        borderRadius: BorderRadius.circular(20),
+        border: Border.all(color: _kBorder),
+        boxShadow: const [
+          BoxShadow(
+            color: Color(0x12000000),
+            blurRadius: 16,
+            offset: Offset(0, 8),
+          ),
+        ],
+      ),
+      child: child,
+    );
+  }
+}
+
+class _SectionHeader extends StatelessWidget {
+  const _SectionHeader({required this.title, required this.subtitle});
+
+  final String title;
+  final String subtitle;
+
+  @override
+  Widget build(BuildContext context) {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Text(
+          title,
+          style: Theme.of(
+            context,
+          ).textTheme.titleLarge?.copyWith(fontWeight: FontWeight.w600),
+        ),
+        const SizedBox(height: 4),
+        Text(
+          subtitle,
+          style: Theme.of(
+            context,
+          ).textTheme.bodySmall?.copyWith(color: _kMuted),
+        ),
+      ],
+    );
+  }
+}
+
+class _StatusPill extends StatelessWidget {
+  const _StatusPill({
+    required this.label,
+    required this.value,
+    required this.isActive,
+  });
+
+  final String label;
+  final String value;
+  final bool isActive;
+
+  @override
+  Widget build(BuildContext context) {
+    final background = isActive ? _kAccentSoft : _kSurfaceAlt;
+    final border = isActive ? _kAccent : _kBorder;
+    final textColor = isActive ? _kAccent : _kMuted;
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+      decoration: BoxDecoration(
+        color: background,
+        borderRadius: BorderRadius.circular(999),
+        border: Border.all(color: border),
+      ),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Text(
+            label,
+            style: Theme.of(context).textTheme.bodySmall?.copyWith(
+              color: textColor,
+              fontWeight: FontWeight.w600,
+            ),
+          ),
+          const SizedBox(width: 6),
+          Text(
+            value,
+            style: Theme.of(
+              context,
+            ).textTheme.bodySmall?.copyWith(color: textColor),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _InlineSwitch extends StatelessWidget {
+  const _InlineSwitch({
+    required this.title,
+    required this.subtitle,
+    required this.value,
+    required this.onChanged,
+  });
+
+  final String title;
+  final String subtitle;
+  final bool value;
+  final ValueChanged<bool>? onChanged;
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+      decoration: BoxDecoration(
+        color: _kSurfaceAlt,
+        borderRadius: BorderRadius.circular(14),
+        border: Border.all(color: _kBorder),
+      ),
+      child: Row(
+        children: [
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  title,
+                  style: Theme.of(
+                    context,
+                  ).textTheme.bodyMedium?.copyWith(fontWeight: FontWeight.w600),
+                ),
+                const SizedBox(height: 4),
+                Text(
+                  subtitle,
+                  style: Theme.of(
+                    context,
+                  ).textTheme.bodySmall?.copyWith(color: _kMuted),
+                ),
+              ],
+            ),
+          ),
+          Switch(value: value, onChanged: onChanged),
+        ],
+      ),
+    );
+  }
+}
+
+class _BulletLine extends StatelessWidget {
+  const _BulletLine({required this.text});
+
+  final String text;
+
+  @override
+  Widget build(BuildContext context) {
+    return Row(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Container(
+          margin: const EdgeInsets.only(top: 6),
+          height: 6,
+          width: 6,
+          decoration: const BoxDecoration(
+            color: _kAccent,
+            shape: BoxShape.circle,
+          ),
+        ),
+        const SizedBox(width: 10),
+        Expanded(
+          child: Text(
+            text,
+            style: Theme.of(
+              context,
+            ).textTheme.bodyMedium?.copyWith(color: _kMuted),
+          ),
+        ),
+      ],
     );
   }
 }
@@ -1217,10 +1810,7 @@ class _LanPeer {
 }
 
 class _LanConnection {
-  _LanConnection({
-    required this.socket,
-    required this.outbound,
-  });
+  _LanConnection({required this.socket, required this.outbound});
 
   final Socket socket;
   final bool outbound;
